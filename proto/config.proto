@@ -1,0 +1,106 @@
+[cfg_proto]
+	cfg_proto = path
+	cfg_proto_chunk = path
+[/cfg_proto]
+
+[exp]
+	cmd = str
+	run_nn_script = str
+	out_folder = str
+	seed = int(-inf,inf)
+	use_cuda = bool
+	multi_gpu = bool
+	n_epochs_tr = int(0,inf)
+	save_models_ep = str
+	skip_training = bool
+	skip_evaluation = bool
+[/exp]
+
+[datasets]
+	[dataset*]
+		data_name = str
+		data_use = {train|valid|test}
+		n_chunks = int
+		[fea*]
+			fea_name = str
+			fea_lst = path
+			fea_proto = path
+			fea_library = path
+			fea_class = str
+		[/fea*]
+
+		[lab*]
+			lab_name = str
+			lab_type = {sequence_like_features,sequence,single_scalar}
+			lab_proto = path
+			lab_library = path
+			lab_class = str
+		[/lab*]
+
+	[/dataset*]
+
+[/datasets]
+
+[data_processing]
+
+	[processing*]
+		proc_name = str
+		proc_proto = path
+		proc_library = path
+		proc_class = str
+	[/processing*]
+
+[/data_processing]
+
+[minibatch_creation]
+	batch_size_train = int(1,inf)
+	max_seq_length_train = int(1,inf)
+	increase_seq_length_train = bool
+	start_seq_len_train = int(1,inf)
+	multply_factor_seq_len_train = int(1,inf)
+	batch_size_valid = int(1,inf)
+	max_seq_length_valid = int
+	order_sentence = {random,ascending,descending}
+[/minibatch_creation]
+
+[neural_networks]
+	[neural_network*]
+		nn_name = str
+		nn_pretrain_file = str
+		nn_freeze = bool
+		nn_seq_model = bool
+		nn_device = str
+		[architecture]
+			dnn_proto = path
+			dnn_library = path
+			dnn_class = str
+			dnn_lay = 1024,512
+		[/architecture]
+
+		[optimizer]
+			opt_proto = path
+			opt_library = path
+			opt_class = str
+			opt_lr = list_str
+			opt_halving_factor = float(0,inf)
+			opt_improvement_threshold = float(0,inf)
+		[/optimizer]
+    [/neural_network*]
+[/neural_networks]
+
+[post_processing]
+	[decoding]
+		post_proc_name = str
+		post_proc_proto = path
+		post_proc_library = path
+		post_proc_class = str
+	[/decoding]
+
+[/post_processing]
+
+[computations]
+    computation_libraries = str
+	data_processing = list_str
+	dnn_computations = list_str
+	post_processing = list_str	
+[/computations]

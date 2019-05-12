@@ -16,25 +16,49 @@ import configparser
 import numpy as np
 from utils import check_cfg,create_lists,create_configs, compute_avg_performance, \
                   read_args_command_line, run_shell,compute_n_chunks, get_all_archs,cfg_item2sec, \
-                  dump_epoch_results, create_curves,change_lr_cfg,expand_str_ep
+                  dump_epoch_results, create_curves,change_lr_cfg,expand_str_ep,config_to_dict, dict_to_config
 from shutil import copyfile
 import re
 from distutils.util import strtobool
 import importlib
 import math
+from data_io import preload_labels,check_if_fea_exist
 
-# Reading global cfg file (first argument-mandatory file) 
+
+# Reading the configuration file (mandatory argument) 
 cfg_file=sys.argv[1]
+
+# check if the config file exists
 if not(os.path.exists(cfg_file)):
      sys.stderr.write('ERROR: The config file %s does not exist!\n'%(cfg_file))
      sys.exit(0)
-else:
-    config = configparser.ConfigParser()
-    config.read(cfg_file)
 
+# read the config file
+config=config_to_dict(cfg_file)
 
 # Reading and parsing optional arguments from command line (e.g.,--optimization,lr=0.002)
-[section_args,field_args,value_args]=read_args_command_line(sys.argv,config)
+config=read_args_command_line(sys.argv,config)
+
+proto_file=config['cfg_proto']['cfg_proto']
+
+# read proto file
+config_proto=config=config_to_dict(proto_file)
+
+
+sys.exit(0)
+
+# check consistency with the types specified in the proto files
+proto_file=config['cfg_proto']['cfg_proto']
+print(proto_file)
+sys.exit(0)
+
+# writing on file the updated config dictionary
+dict_to_config(config,cfg_file)
+
+config=config_to_dict(cfg_file)
+
+sys.exit(0)
+
 
 
 # Output folder creation
@@ -144,6 +168,13 @@ fea_dict=[]
 lab_dict=[]
 arch_dict=[]
 
+# --------READING ALL THE LABELS --------#
+
+check_if_fea_exist(config)
+labs=preload_labels(config)
+
+
+
  
 # --------TRAINING LOOP--------#
 for ep in range(N_ep):
@@ -192,8 +223,8 @@ for ep in range(N_ep):
 
                         
                     # run chunk processing                    
-                    [data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict]=run_nn(data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict,config_chunk_file,processed_first,next_config_file)
-                                        
+                    [data_name,data_set,data_end_index,fea_dict,lab_dict,arch_dict]=run_nn(labs,config_chunk_file,processed_first,next_config_file)
+                    sys.exit(0)                    
                     
                     # update the first_processed variable
                     processed_first=False

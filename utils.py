@@ -11,15 +11,12 @@ import os.path
 import random
 import subprocess
 import numpy as np
-import re
 import glob
 from distutils.util import strtobool
-import importlib
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import math
-
+import re
 
 
 def run_command(cmd):
@@ -58,77 +55,182 @@ def run_shell(cmd,log_file):
     #print(output.decode("utf-8"))    
     return output
 
+def config_to_dict(config_file):
+    # This script reads the config file and converts it into a hierarchical python dictionary.
+    # e.g, config['datasets']['dataset1']['fea1']['fea_name']
+    
+    # readinng the config file
+    config_lst = open(config_file, "r")
+    
+    # initialization of the config dictionary
+    config={}
+    
+    # active tags tracking list
+    active_tags=[]
+    
+    # search pattern
+    open_tag='\[.*\]' # open tags (e.g., [exp]) 
+    close_tag='\[/.*\]' # close tags (e.g, [/exp])
+    value_pattern='(.*)=(.*)' # field=value lines
+    begin_block='\{' # this pattern indicates the beginning of a code block
+    end_block='\}' # this pattern indicatws the end of a code block
+    
+    
+    # the following varible is 
+    reading_string_block=False
+    
+    for line in config_lst:
+        
+        # removing empty characters
+        line=line.strip()
+      
+        # Detecting open tags [..]
+        if bool(re.search(open_tag, line)) and not(bool(re.search(close_tag, line))):
+            
+            # remove spaces
+            active_tags.append(line.replace(' ',''))
+            
+            # initialize the curr_dict
+            curr_dict=config
+            
+            for tag in active_tags:
+                tag=tag.replace('[','')
+                tag=tag.replace(']','')
+                tag=tag.strip()
+                
+                # finding the current position within the dictionary
+                if  tag in curr_dict.keys(): 
+                    curr_dict=curr_dict[tag]
+                else:
+                    # if tag does not exist, create entry
+                    curr_dict[tag]={}
+                    curr_dict=curr_dict[tag]
+                    
+       
+        # Detecting close tags [/..]
+        if bool(re.search(close_tag, line)):
+            
+            # remove spaces
+            closed_tag=line.replace(' ','')
+              
+            # check if tags are correctly closed
+            if closed_tag.replace('[/','[')!=active_tags[-1]:
+                sys.stderr.write('ERROR: the tag %s is not closed properly! It should be closed before %s \n'%(active_tags[-1],closed_tag))
+                sys.exit(0)
+            else:
+                # removing from the active tag list the closed element
+                del(active_tags[-1])
+          
+            
+            
+        # Detecting value lines and adding them into the dictionary
+        if bool(re.search(value_pattern, line)) and not(reading_string_block):
+             entries=line.split('=')
+             field=entries[0].strip()
+             value='='.join(entries[1:]).strip()
+            
+             # check if the begin_block pattern is present
+             if begin_block in line:
+                reading_string_block=True
+                block_str=[]
+                curr_dict[field]=block_str
+                line=value
+                
+             
+             if not(reading_string_block):
+                curr_dict[field]=value
+          
+        # Reading code block    
+        if reading_string_block:
+            block_str.append(line.strip())
+    
+            # check if a block of code is ended    
+            if end_block in line:
+                reading_string_block=False
+                curr_dict[field]=list(filter(None, block_str))
+            
+            
+    # check if all the tags are closed        
+    if len(active_tags)>0:
+       sys.stderr.write('ERROR: the following tags are opened but not closed! %s \n' %(active_tags))
+       sys.exit(0)
+    
+    # closing the config file    
+    config_lst.close()
+    
+    return config
+ 
+
+def print_dict_rec(dictionary,n_tabs,f):
+    # This function reads the config dictionary and convert into into a text form
+    
+    # managing tabs for better identation
+    tabs=''
+    for i in range(n_tabs):
+        tabs=tabs+'\t'
+
+    # reading all the keys of the dictionary    
+    for key in dictionary.keys():
+        
+        if type(dictionary[key]) is dict:
+            f.write('%s[%s]\n' %(tabs,key))
+            # if the value is a dictionary I fully explore this branch using a recursive function
+            print_dict_rec(dictionary[key],n_tabs+1,f)
+            f.write('%s[/%s]\n\n' %(tabs,key))
+        else:
+            # if the value is not dictionary, I reached a leaf value
+            if type(dictionary[key]) is str:
+                f.write('%s%s = %s\n' %(tabs,key,dictionary[key]))
+            # if the entry is a code block
+            if type(dictionary[key]) is list:
+                first_line=True
+                for line in dictionary[key]:
+                    if first_line:
+                        f.write('%s%s = %s\n'%(tabs,key,line))
+                        first_line=False
+                    else:
+                        f.write('\t%s%s\n'%(tabs,line))
+                f.write('\n')   
+          
+            
+
+def dict_to_config(config,config_file):
+    # This function converts a config dictionary into a config file in txt format.
+    config_file = open(config_file, 'w')
+    print_dict_rec(config,0,config_file)
+    config_file.close()
+
 
 def read_args_command_line(args,config):
     
-    sections=[]
-    fields=[]
-    values=[]
-
-    for i in range(2,len(args)):
-
-        # check if the option is valid for second level
-        r2=re.compile('--.*,.*=.*')
-
-        # check if the option is valid for 4 level
-        r4=re.compile('--.*,.*,.*,.*=".*"')
-        if r2.match(args[i]) is None and r4.match(args[i]) is None:
-            sys.stderr.write('ERROR: option \"%s\" from command line is not valid! (the format must be \"--section,field=value\")\n' %(args[i]))
+    # removing the first two arguments (i.e., the script name and the mandatory configuration name of the file)
+    args=args[2:] 
+    for arg in args:
+        line=arg.split('=')
+        if len(line)==1:
+            sys.stderr.write("ERROR:the argument %s from the command line is not in the correct format! Expected something like field1,field2,field2=value (e.g., datasets,dataset2,fea_name=raw).\n" % (line))
             sys.exit(0)
+         
+        # reading the specified fields and values to change
+        fields=line[0].split(',')
+        value=line[1]
         
-        sections.append(re.search('--(.*),', args[i]).group(1))
-        fields.append(re.search(',(.*)', args[i].split('=')[0]).group(1))
-        values.append(re.search('=(.*)', args[i]).group(1))
-
-    # parsing command line arguments
-    for i in range(len(sections)):
-
-        # Remove multi level is level >= 2
-        sections[i] = sections[i].split(',')[0]
-
-        if sections[i] in config.sections():
-
-            # Case of args level > than 2 like --sec,fields,0,field="value"
-            if len(fields[i].split(',')) >= 2:
-
-                splitted = fields[i].split(',')
-
-                #Get the actual fields
-                field  = splitted[0]
-                number = int(splitted[1])
-                f_name = splitted[2]
-                if field in list(config[sections[i]]):
-
-                    # Get the current string of the corresponding field
-                    current_config_field = config[sections[i]][field]
-
-                    # Count the number of occurence of the required field
-                    matching = re.findall(f_name+'.', current_config_field)
-                    if number >= len(matching):
-                        sys.stderr.write('ERROR: the field number \"%s\" provided from command line is not valid, we found \"%s\" \"%s\" field(s) in section \"%s\"!\n' %(number, len(matching), f_name, field ))
-                        sys.exit(0)
-                    else:
-                        
-                        # Now replace
-                        str_to_be_replaced         = re.findall(f_name+'.*', current_config_field)[number]
-                        new_str                    = str(f_name+'='+values[i])
-                        replaced                   = nth_replace_string(current_config_field, str_to_be_replaced, new_str, number+1)
-                        config[sections[i]][field] = replaced
-
+        config_curr=config
+        for field in fields:
+            
+            if type(config_curr[field]) is dict:
+                # go to the next level of the hierarchy
+                if field in config_curr.keys():
+                    config_curr=config_curr[field]
                 else:
-                    sys.stderr.write('ERROR: field \"%s\" of section \"%s\" from command line is not valid!")\n' %(field,sections[i]))
+                    sys.stderr.write("ERROR: the field  %s specified in the command line does not exist. The possible fields are %s \n" % (field,config_curr.keys()))
                     sys.exit(0)
             else:
-                if fields[i] in list(config[sections[i]]):
-                    config[sections[i]][fields[i]]=values[i]
-                else:
-                    sys.stderr.write('ERROR: field \"%s\" of section \"%s\" from command line is not valid!")\n' %(fields[i],sections[i])) 
-                    sys.exit(0)
-        else:
-            sys.stderr.write('ERROR: section \"%s\" from command line is not valid!")\n' %(sections[i]))
-            sys.exit(0)
+                # leaf node
+                config_curr[field]=value
         
-    return [sections,fields,values]
+    return config
+        
 
 
 def compute_avg_performance(info_lst):
@@ -653,11 +755,11 @@ def check_cfg(cfg_file,config,cfg_file_proto):
                        
                        
     # Check the model field
-    parse_model_field(cfg_file)
+    # parse_model_field(cfg_file)
 
     
     # Create block diagram picture of the model
-    create_block_diagram(cfg_file)
+    # create_block_diagram(cfg_file)
     
 
 
@@ -994,7 +1096,8 @@ def create_lists(config):
     
     
 def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst_file,info_file,to_do,data_set_name,lr,max_seq_length_train_curr,name_data,ep,ck,batch_size,drop_rates):
-                    
+    
+              
     # writing the chunk-specific cfg file
     config = configparser.ConfigParser()
     config.read(cfg_file)
@@ -1005,11 +1108,12 @@ def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst
     # Exp section
     config_chunk['exp']['to_do']=to_do
     config_chunk['exp']['out_info']=info_file
+    # Automatic Detection of the adopted dataset
+    config_chunk['exp']['dataset']='_'.join(info_file.split('/')[-1].split('_ep')[0].split('_')[1:])
     
     # change seed for randomness
     config_chunk['exp']['seed']=str(int(config_chunk['exp']['seed'])+ep+ck)
     
-    config_chunk['batches']['batch_size_train']=batch_size
     
     for arch in pt_files.keys():
         config_chunk[arch]['arch_pretrain_file']=pt_files[arch]
@@ -1065,8 +1169,25 @@ def write_cfg_chunk(cfg_file,config_chunk_file,cfg_file_proto_chunk,pt_files,lst
     config_chunk.remove_option('batches','increase_seq_length_train')
     config_chunk.remove_option('batches','start_seq_len_train')
     config_chunk.remove_option('batches','multply_factor_seq_len_train')
+    config_chunk.remove_option('batches','batch_size_valid')
+    config_chunk.remove_option('batches','batch_size_train')
+    config_chunk.remove_option('batches','max_seq_length_valid')
+    config_chunk.remove_option('batches','max_seq_length_train')
     
-    config_chunk['batches']['max_seq_length_train']=str(max_seq_length_train_curr)
+    if to_do=='train':
+        config_chunk['batches']['batch_size']=batch_size
+        config_chunk['batches']['max_seq_length']=str(max_seq_length_train_curr)
+        
+        
+    if to_do=='valid':
+        config_chunk['batches']['batch_size']=config['batches']['batch_size_valid']
+        config_chunk['batches']['max_seq_length']=config['batches']['max_seq_length_valid']
+        
+    if to_do=='forward':
+        config_chunk['batches']['max_seq_length']='-1'
+        config_chunk['batches']['batch_size']='1'
+        
+        
     
     # Write cfg_file_chunk
     with open(config_chunk_file, 'w') as configfile:
@@ -1660,87 +1781,11 @@ def compute_cw_max(fea_dict):
     return [cw_left_max,cw_right_max]
 
 
-def model_init(inp_out_dict,model,config,arch_dict,use_cuda,multi_gpu,to_do):
-    
-    pattern='(.*)=(.*)\((.*),(.*)\)'
-     
-    nns={}
-    costs={}
-       
-    for line in model:
-        [out_name,operation,inp1,inp2]=list(re.findall(pattern,line)[0])
-        
-        if operation=='compute':
-            
-            # computing input dim
-            inp_dim=inp_out_dict[inp2][-1]
-            
-            # import the class
-            module = importlib.import_module(config[arch_dict[inp1][0]]['arch_library'])
-            nn_class=getattr(module, config[arch_dict[inp1][0]]['arch_class'])
-            
-            # add use cuda and todo options
-            config.set(arch_dict[inp1][0],'use_cuda',config['exp']['use_cuda'])
-            config.set(arch_dict[inp1][0],'to_do',config['exp']['to_do'])
-            
-            arch_freeze_flag=strtobool(config[arch_dict[inp1][0]]['arch_freeze'])
-
-            
-            # initialize the neural network
-            net=nn_class(config[arch_dict[inp1][0]],inp_dim)
-    
-    
-            
-            if use_cuda:
-                net.cuda()
-                if multi_gpu:
-                    net = nn.DataParallel(net)
-                    
-            
-            if to_do=='train':
-                if not(arch_freeze_flag):
-                    net.train()
-                else:
-                   # Switch to eval modality if architecture is frozen (mainly for batch_norm/dropout functions)
-                   net.eval() 
-            else:
-                net.eval()
-    
-            
-            # addigng nn into the nns dict
-            nns[arch_dict[inp1][1]]=net
-            
-            if multi_gpu:
-                out_dim=net.module.out_dim
-            else:
-                out_dim=net.out_dim
-                
-            # updating output dim
-            inp_out_dict[out_name]=[out_dim]
-            
-        if operation=='concatenate':
-            
-            inp_dim1=inp_out_dict[inp1][-1]
-            inp_dim2=inp_out_dict[inp2][-1]
-            
-            inp_out_dict[out_name]=[inp_dim1+inp_dim2]
-        
-        if operation=='cost_nll':
-            costs[out_name] = nn.NLLLoss()
-            inp_out_dict[out_name]=[1]
-            
-            
-        if operation=='cost_err':
-            inp_out_dict[out_name]=[1]
-            
-        if operation=='mult' or operation=='sum' or operation=='mult_constant' or operation=='sum_constant' or operation=='avg' or operation=='mse':
-            inp_out_dict[out_name]=inp_out_dict[inp1]    
-
-    return [nns,costs]
 
 
 
 def optimizer_init(nns,config,arch_dict):
+    
     
     # optimizer init
     optimizers={}

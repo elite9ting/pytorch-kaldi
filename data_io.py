@@ -11,279 +11,805 @@ from utils import compute_cw_max,dict_fea_lab_arch,is_sequential_dict
 import os
 import configparser
 import re, gzip, struct
+import threading
+import glob
+import math
+import random 
+import torch
 
-
-def load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only=False):
-
-    
-    fea = { k:m for k,m in read_mat_ark('ark:copy-feats scp:'+fea_scp+' ark:- |'+fea_opts,output_folder) }
-
-    if not fea_only:
-      lab = { k:v for k,v in read_vec_int_ark('gunzip -c '+lab_folder+'/ali*.gz | '+lab_opts+' '+lab_folder+'/final.mdl ark:- ark:-|',output_folder)  if k in fea} # Note that I'm copying only the aligments of the loaded fea
-      fea = {k: v for k, v in fea.items() if k in lab} # This way I remove all the features without an aligment (see log file in alidir "Did not Succeded")
-
-    end_snt=0
-    end_index=[]
-    snt_name=[]
-    fea_conc=[]
-    lab_conc=[]
-    
-    tmp=0
-    for k in sorted(sorted(fea.keys()), key=lambda k: len(fea[k])):
-
-        #####
-        # If the sequence length is above the threshold, we split it with a minimal length max/4
-        # If max length = 500, then the split will start at 500 + (500/4) = 625. 
-        # A seq of length 625 will be splitted in one of 500 and one of 125
+def LoadData(cfg_file,lab_all,shared_list):
 
         
-        if(len(fea[k]) > max_sequence_length) and max_sequence_length>0:
-
-          fea_chunked = []
-          lab_chunked = []
-
-          for i in range((len(fea[k]) + max_sequence_length - 1) // max_sequence_length):
-            if(len(fea[k][i * max_sequence_length:]) > max_sequence_length + (max_sequence_length/4)):
-              fea_chunked.append(fea[k][i * max_sequence_length:(i + 1) * max_sequence_length])
-              if not fea_only:
-                lab_chunked.append(lab[k][i * max_sequence_length:(i + 1) * max_sequence_length])
-              else:
-                lab_chunked.append(np.zeros((fea[k][i * max_sequence_length:(i + 1) * max_sequence_length].shape[0],)))
-            else:
-              fea_chunked.append(fea[k][i * max_sequence_length:])
-              if not fea_only:
-                lab_chunked.append(lab[k][i * max_sequence_length:])
-              else:
-                lab_chunked.append(np.zeros((fea[k][i * max_sequence_length:].shape[0],)))
-              break
-
-          for j in range(0, len(fea_chunked)):
-            fea_conc.append(fea_chunked[j])
-            lab_conc.append(lab_chunked[j])
-            snt_name.append(k+'_split'+str(j))
-            
+        # Reading chunk-specific cfg file (first argument-mandatory file) 
+        if not(os.path.exists(cfg_file)):
+             sys.stderr.write('ERROR: The config file %s does not exist!\n'%(cfg_file))
+             sys.exit(0)
         else:
-          fea_conc.append(fea[k])
-          if not fea_only:
-            lab_conc.append(lab[k])
-          else:
-            lab_conc.append(np.zeros((fea[k].shape[0],)))
-          snt_name.append(k)
-
-        tmp+=1
-
-    fea_zipped = zip(fea_conc,lab_conc)
-    fea_sorted = sorted(fea_zipped, key=lambda x: x[0].shape[0])
-    fea_conc,lab_conc = zip(*fea_sorted)
-      
-    for entry in fea_conc:
-      end_snt=end_snt+entry.shape[0]
-      end_index.append(end_snt)
-
-    fea_conc=np.concatenate(fea_conc)
-    lab_conc=np.concatenate(lab_conc)
-
-    return [snt_name,fea_conc,lab_conc,np.asarray(end_index)] 
-
-
-def context_window_old(fea,left,right):
- 
- N_row=fea.shape[0]
- N_fea=fea.shape[1]
- frames = np.empty((N_row-left-right, N_fea*(left+right+1)))
- 
- for frame_index in range(left,N_row-right):
-  right_context=fea[frame_index+1:frame_index+right+1].flatten() # right context
-  left_context=fea[frame_index-left:frame_index].flatten() # left context
-  current_frame=np.concatenate([left_context,fea[frame_index],right_context])
-  frames[frame_index-left]=current_frame
-
- return frames
-
-def context_window(fea,left,right):
- 
-    N_elem=fea.shape[0]
-    N_fea=fea.shape[1]
-    
-    fea_conc=np.empty([N_elem,N_fea*(left+right+1)])
-    
-    index_fea=0
-    for lag in range(-left,right+1):
-        fea_conc[:,index_fea:index_fea+fea.shape[1]]=np.roll(fea,lag,axis=0)
-        index_fea=index_fea+fea.shape[1]
+            config = configparser.ConfigParser()
+            config.read(cfg_file)
+            
         
-    fea_conc=fea_conc[left:fea_conc.shape[0]-right]
+        # Reading some cfg parameters
+        output_folder=config['exp']['out_folder']
+        dataset=config['exp']['dataset']
+        seed=int(config['exp']['seed'])
+        batch_size=int(config['batches']['batch_size'])
+        
+        max_seq_length=int(config['batches']['max_seq_length']) # Read the maximum length allowed for the speech sequence
+                
+        # Putting information about features, labels, and architectures on dictionaries
+        # this information will be later useful to initialize the model and forward the data through the model
+        
+        [fea_info,lab_info,arch_info]=dict_fea_lab_arch(config)
+        
+        
+        # Check if the model is recurrent (sequential) or non-recurrent (feed-forward)
+        rnn_model=is_sequential_dict(config,arch_info)
+
+
+        # Detecting the maximum length of the specified context windows (useful to male different features of the same length)
+        [cw_left_max,cw_right_max]=compute_cw_max(fea_info)
+
+        
+        # Loading all the features in parallel (stored in the fea_data_dict[fea_type][snt_id] dictionary)
+        fea_data_dict={}
+        
+        #create a list of threads
+        threads = []
+        
+        for fea in fea_info.keys():
+            fea_scp=fea_info[fea][1]
+            fea_opts=fea_info[fea][2]
+            fea_type=detect_fea_type(fea_scp)            
+            
+            p=threading.Thread(target=load_features, args=(fea_type,fea_scp,fea_opts,output_folder,fea,fea_data_dict))
+            threads.append(p)
+            p.start()
+
+            
+        # Wait until all processes are finished 
+        for p in threads:
+            p.join()
+            
+            
+        # Check features (check if all the feature types have the sentence-ids and the same length)
+        fea_data_dict=check_features(fea_data_dict,output_folder)
+
+        # Cross-check between features and labels (check if labels and features contain the same sentence-ids and are of the same length)
+        common_set=cross_check_lab_fea(fea_data_dict,lab_all,dataset,output_folder)
+        
+        # select only the subset of features that have a corresponding label
+        fea_data_dict=select_fea(fea_data_dict,common_set)
+        
+        # select only the subset of labels of the current chunk
+        lab_chunk=select_lab(lab_all,dataset,common_set)
+        
+        # compute mean and standard deviation statistics
+        [mean_dict,std_dict]=compute_mean_std(fea_data_dict)
+                       
+        # Split the sequences that are longer than the specified max_seq_length 
+        fea_data_dict=split_fea(fea_data_dict,max_seq_length)
+        lab_chunk=split_lab(lab_chunk,max_seq_length)
+        
+        # Expand the sentences with a context window (if needed)
+        fea_data_dict=apply_context_window(fea_data_dict,fea_info)
+        
+        # Check again that all the features have same temporal dimension
+        double_check_fea_lab(fea_data_dict,lab_chunk)
+        
+        # Convert the features to pytorch
+        fea_data_dict=fea_to_pytorch(fea_data_dict)
+        
+        
+        # Add final dimensionality for each feature type into fea_info dict
+        for fea_type in fea_data_dict.keys():
+            snt_id=list(fea_data_dict[fea_type].keys())[0]
+            fea_info[fea_type].append(fea_data_dict[fea_type][snt_id].shape[1])
+        
+        # Order the list of sentence (ascending, discending, shuffle)
+        sentence_order='shuffle'
+        snt_lst=sentence_ordering(fea_data_dict,sentence_order,seed)
+                          
+        # Create batches (the creation of batches is different between recurrent and non-recurrent networks)
+        if not(rnn_model):   
+            # Create batches for non-sequential neural network (i.e., feed-forward)
+            [fea_batches_dict,lab_batches_dict]=create_batches_feed_forward(fea_info,batch_size,fea_data_dict,lab_chunk,snt_lst,sentence_order,seed)
+        else:
+            # Create batches for recurrent neural networks
+            [fea_batches_dict,lab_batches_dict]=create_batches_recurrent(fea_info,batch_size,fea_data_dict,lab_chunk,snt_lst,seed)
+        
+        
+        # The generated dictionaries are structured as follows:             
+        # fea_batches_dict[batch_id][fea_id][sample_id]
+        # lab_batches_dict[batch_id][label_id][sample_id]
+
+        
+        shared_list.append(fea_batches_dict)
+        shared_list.append(fea_info)
+        shared_list.append(lab_batches_dict)
+        shared_list.append(lab_info)
+        shared_list.append(arch_info)
+
+                 
+        # To do: try DNN experiment and check performance, try RNN experiment and check performance, CMVN options
+
+
+                    
+        
+        
+def preload_labels(config):
     
-    return fea_conc
+    # This function loads all the labels in RAM once. 
+    # This way the labels don’t have to be read from disk every time. 
+    # We do it with labels only because features can be much more memory demanding and might not fit into the memory.
+    
+    data_dict=create_data_dict(config)
+    tr_data_lst=config['data_use']['train_with'].split(',')
+    valid_data_lst=config['data_use']['valid_with'].split(',')
+    output_folder=config['exp']['out_folder']
+    
+
+    # Reading labels in parallel (one thread for each ali.*.tar.gz file)
+    lab_all={}
+    for data in tr_data_lst+valid_data_lst:
+        lab_all[data]={}
+        
+        for key in data_dict[data]['lab'].keys():
+            lab_folder=data_dict[data]['lab'][key][0].split('lab_folder=')[1]
+            
+            # Check if folder exists
+            if not(os.path.isdir(lab_folder)):
+                sys.stderr.write('ERROR the lab_folder %s does not exist\n' %(lab_folder)) 
+                sys.exit(0)
+                
+            lab_type=detect_lab_type(lab_folder)
+            lab_opts=data_dict[data]['lab'][key][1].split('lab_opts=')[1]
+            ali_list=glob.glob(lab_folder+'/ali.*.gz')
+            
+            # Check if alignments exists
+            if len(ali_list)==0:
+                sys.stderr.write('ERROR the lab_folder %s does not contain alignments (*ali.*.gz)\n' %(lab_folder)) 
+                sys.exit(0)
+                
+            lab_parallel ={}
+            lab_all[data][key]={}
+            
+            threads = []
+            
+            for ali_file in ali_list:
+                ali_index=ali_file.split('ali.')[1].split('.gz')[0]
+                p=threading.Thread(target=load_labels, args=(lab_type,ali_file, lab_opts, lab_folder, output_folder, lab_parallel ,ali_index))            
+                threads.append(p)
+                p.start()
+                
+            # Wait until all processes are finished 
+            for p in threads:
+                p.join()
+                
+            # gather all the results into a single dictionary     
+            for ali_id in lab_parallel.keys():
+               lab_all[data][key].update(lab_parallel[ali_id]) 
+               
+    # check labels
+    lab_all=check_labels(lab_all,output_folder)
+    
+    # convert labels to pytorch
+    lab_all=lab_to_pytorch(lab_all)
+
+         
+    
+
+    
+    return lab_all
 
 
-def load_chunk(fea_scp,fea_opts,lab_folder,lab_opts,left,right,max_sequence_length, output_folder,fea_only=False):
+def load_labels(lab_type,ali_file, lab_opts, lab_folder, output_folder,lab_shared,ali_index):
+    if lab_type=='kaldi':
+        lab_shared[ali_index] = { k:v for k,v in read_vec_int_ark('gunzip -c '+ali_file+' | '+lab_opts+' '+lab_folder+'/final.mdl ark:- ark:-|',output_folder)}
+
+
+def load_features(fea_type,fea_scp,fea_opts,output_folder,fea_name,dict_fea):
+  if fea_type=='kaldi':
+      dict_fea[fea_name] = { k:m for k,m in read_mat_ark('ark:copy-feats scp:'+fea_scp+' ark:- |'+fea_opts,output_folder) }
+
+def apply_context_window(fea_data_dict,fea_dict):
+    
+    # This function loops over all the sentences and features and apply the context windows specified in the cfg file. 
+    # At the boundaries of the sentences, zero padding has been performed.   
   
-  # open the file
-  [data_name,data_set,data_lab,end_index]=load_dataset(fea_scp,fea_opts,lab_folder,lab_opts,left,right, max_sequence_length, output_folder, fea_only)
+    for fea_type in fea_data_dict.keys():
+        cw_left=int(fea_dict[fea_type][3])
+        cw_right=int(fea_dict[fea_type][4])
 
-  # Context window
-  if left!=0 or right!=0:
-      data_set=context_window(data_set,left,right)
+        if  cw_left>0 or cw_right>0:
+            for snt_id in  fea_data_dict[fea_type].keys():
+                N_fea=fea_data_dict[fea_type][snt_id].shape[0]
+                fea_dim=fea_data_dict[fea_type][snt_id].shape[1]
+                
+                fea_expanded=np.zeros([N_fea,fea_dim,cw_left+cw_right+1])
+                index_cnt=0
+                for lag in range(-cw_left,cw_right+1):
+                    fea_expanded[:,:,index_cnt]=np.roll(fea_data_dict[fea_type][snt_id],-lag,axis=0)
+                    if lag<0:
+                       fea_expanded[0:-lag,:,index_cnt]=np.zeros(fea_expanded[0:-lag,:,index_cnt].shape) 
+                    
+                    if lag>0:
+                       fea_expanded[-lag:,:,index_cnt]=np.zeros(fea_expanded[-lag:,:,index_cnt].shape)
+                    
+                    index_cnt=index_cnt+1
+                # reshape tensor (put all the context features in the same feature vector)    
+                fea_data_dict[fea_type][snt_id]=fea_expanded.reshape(fea_expanded.shape[0],-1)
 
-  end_index=end_index-left
-  end_index[-1]=end_index[-1]-right
+                
+    return fea_data_dict
 
-  # mean and variance normalization
-  data_set=(data_set-np.mean(data_set,axis=0))/np.std(data_set,axis=0)
+def create_batches_feed_forward(fea_dict,batch_size,fea_data_dict,lab_chunk,snt_lst,sentence_order,seed):
+    
+    # This function creates the batches when a feed-forward neural network is used. 
+    # Batch-specific dictionaries are formed for both features and labels.  
+    # For instance,  fea_batches_dict[‘batch_11’][‘mfcc’] contains a numpy matrix of dimension (N_batch, fea_dim). 
+    # Similarly,  lab_batches_dict[‘batch_11’][‘lab_cd’] contains the labels for batch 11. 
+    # Create list of all the feature frames (useful for shuffling)
+    
+    # Initializing the batch dictionaries
+    fea_batches_dict={}
+    lab_batches_dict={}
+    
+    # Create a list of all the features in the chunk
+    fea_all_lst=create_all_fea_lst(fea_data_dict,snt_lst)
 
-  # Label processing
-  data_lab=data_lab-data_lab.min()
-  if right>0:
-    data_lab=data_lab[left:-right]
-  else:
-    data_lab=data_lab[left:]   
-  
-  data_set=np.column_stack((data_set, data_lab))
+    # Shuffle the list (if needed)
+    if sentence_order=='shuffle':
+        random.seed(seed)
+        random.shuffle(fea_all_lst)
+        
+    # Split the list features in list of batches
+    fea_all_lst=list(split_list(fea_all_lst,batch_size))
+    
+    # Removing the last batch because can contain only few elements
+    if len(fea_all_lst[-1])<batch_size:
+        del (fea_all_lst[-1])
+            
+    # Compute feature/label dimensionalities
+    fea_dim=compute_dim(fea_data_dict)
+    lab_dim=compute_dim(lab_chunk)
+        
+    N_batches=len(fea_all_lst)
+    
+    
+    for batch_id in range(N_batches):
+         key_batch='batch_'+str(batch_id)
+         
+         # Initializing batch-specific dictionaries
+         fea_batches_dict[key_batch]={}
+         lab_batches_dict[key_batch]={}
+         
+         for fea in fea_dict.keys():
+             fea_batches_dict[key_batch][fea]=torch.zeros([batch_size,fea_dim[fea]])
+         
+         for lab in lab_chunk.keys():
+             lab_batches_dict[key_batch][lab]=torch.zeros([batch_size,lab_dim[lab]])
+         
+         # Fill all the batch-specific dictionaries with the selected features and labels
+         for sample in range(batch_size):
+             
+            # Detecting sample_id and frame_id from fea_all_lst
+            [sample_id,frame_id]=fea_all_lst[batch_id][sample].split(':Frame_')
+            frame_id=int(frame_id)
+            
+            # filling the batch-specific dictionary
+            for fea in fea_dict.keys():
+                fea_batches_dict[key_batch][fea][sample]=fea_data_dict[fea][sample_id][frame_id]
+                
+            for lab in lab_chunk.keys():
+                lab_batches_dict[key_batch][lab][sample]=lab_chunk[lab][sample_id][frame_id]
+                
+    return [fea_batches_dict,lab_batches_dict]
 
-  return [data_name,data_set,end_index]
 
+def create_batches_recurrent(fea_dict,batch_size,fea_data_dict,lab_chunk,snt_lst,seed):
+    
+    # This function creates the batches when a recurrent neural network is used. 
+    # Batch-specific dictionaries are formed for both features and labels.  
+    # For instance,  fea_batches_dict[‘batch_11’][‘mfcc’][0] contains a numpy matrix of dimension (N_time_steps, fea_dim) that refers to the first sample of mfcc features of the batch 11
+    # Similarly,  lab_batches_dict[‘batch_11’][‘lab_cd’][0] contains the labels for batch 11-sample 0. 
+    
+    # Initializing the batch dictionaries
+    fea_batches_dict={}
+    lab_batches_dict={}
+    
+    # Split the sentence list in N_batch sub-lists
+    snt_lst=list(split_list(snt_lst,batch_size))
+    
+    # Removing the last batch because can contain only few elements
+    if len(snt_lst[-1])<batch_size:
+        del (snt_lst[-1])
+        
+    N_batches=len(snt_lst)
+    
+    
+    for batch_id in range(N_batches):
+         key_batch='batch_'+str(batch_id)
+         
+         # Initializing batch-specific dictionaries
+         fea_batches_dict[key_batch]={}
+         lab_batches_dict[key_batch]={}
+         
+         for fea in fea_dict.keys():
+             fea_batches_dict[key_batch][fea]=[]
+         
+         for lab in lab_chunk.keys():
+             lab_batches_dict[key_batch][lab]=[]
+         
+         # Fill all the batch-specific dictionaries with the selected features and labels
+         for snt_id in snt_lst[batch_id]:
+            
+            # filling the batch-specific dictionary
+            for fea in fea_dict.keys():
+                fea_batches_dict[key_batch][fea].append(fea_data_dict[fea][snt_id])
+                
+            for lab in lab_chunk.keys():
+                lab_batches_dict[key_batch][lab].append(lab_chunk[lab][snt_id])
+                
+    return [fea_batches_dict,lab_batches_dict]
+
+def sentence_ordering(fea_data_dict,sentence_order,seed):
+    
+    # This function sorts the sentence of the chunks as specified in the config file. 
+    # If the specified order is ascending, the sentences are sorted from the shortest to the longest one. 
+    # If the order is descending, the sentences are sorted from the longest to the shortest. 
+    # Finally, if the  order is set as “shuffle”, the sentences are randomized. 
+    
+    fea_lst=list(fea_data_dict.keys())
+    
+    if sentence_order=='ascending':
+        snt_lst=sorted(sorted(fea_data_dict[fea_lst[0]].keys()), key=lambda k: len(fea_data_dict[fea_lst[0]][k]))
+    
+    if sentence_order=='descending':
+        snt_lst=sorted(sorted(fea_data_dict[fea_lst[0]].keys()), key=lambda k: -len(fea_data_dict[fea_lst[0]][k]))
+    
+    if sentence_order=='shuffle':
+        snt_lst=list(fea_data_dict[fea_lst[0]].keys())
+        random.seed(seed)
+        random.shuffle(snt_lst)
+        
+    return snt_lst 
+                
+                
+def check_features(fea_data_dict,output_folder):
+        # check if all the feature types have the sentence-ids and the same length
+        
+        diff_th_error=0.9 # Rise an error if the features types differs too much
+        
+        fea_keys=list(fea_data_dict.keys())
+        
+        for i in range(len(fea_keys)):
+            fea_key=fea_keys[i]
+            current_set=set(fea_data_dict[fea_key])
+            if i==0:
+                global_set=current_set
+                diff_set=set(global_set-current_set)
+            else:
+                diff_set=set(global_set-current_set)
+                global_set=global_set.intersection(current_set)
+              
+            
+            if len(diff_set)>0:
+                with open(output_folder+'/log.log', 'a+') as logfile:
+                    for line in diff_set:
+                        logfile.write('WARNING: No Features for '+ line+'\n')          
+                
+            # Rise an error if the featues set are too different    
+            if len(global_set)<int(len(current_set)*diff_th_error):
+                sys.stderr.write('ERROR: The given features differ too much. Please, take a look into the provided labels and make sure they have the same sentence_id. See the file %s\n' %(output_folder+'/log.log')) 
+                sys.exit(0)
+
+        # Select the subset of common labels
+        fea_data_dict_sel={}
+        for key in fea_data_dict.keys():
+            fea_data_dict_sel[key] = { k:v for k, v in  fea_data_dict[key].items() if k in list(global_set)}
+        
+        fea_data_dict=fea_data_dict_sel
+              
+        
+        # check if all the features types have the same length
+        for snt_id in list(global_set):
+            fea_type_key=list(fea_data_dict.keys())
+            for i in range(len(fea_type_key)):
+                if i==0:
+                    ref= fea_data_dict[fea_type_key[i]][snt_id].shape[0]
+                else:
+                    val= fea_data_dict[fea_type_key[i]][snt_id].shape[0]
+                    if val!=ref:
+                       sys.stderr.write('ERROR: the sentence %s has different feature lengths between %s and %s. All the labels must have the same length.\n' %(snt_id,fea_type_key[i],fea_type_key[0])) 
+                       sys.exit(0)
+                       
+        return fea_data_dict
+
+
+def cross_check_lab_fea(fea_data_dict,lab_all,dataset,output_folder):
+    
+    fea_check=fea_data_dict[list(fea_data_dict.keys())[0]]
+    lab_check=lab_all[dataset][list(lab_all[dataset].keys())[0]]
+    
+    # derive the common set of features and labels
+    common_set=set(fea_check).intersection(set(lab_check))
+    
+    # derive the differences between features and labels        
+    diff_set_fea=set(set(fea_check)-common_set)
+    
+    # Writing the differences on file 
+    if len(diff_set_fea)>0:
+        with open(output_folder+'/log.log', 'a+') as logfile:
+            for line in diff_set_fea:
+                logfile.write('WARNING: No labels for '+ line+'\n')
+     
+    diff_th_error=0.05
+    # Rise an error if the labels set are too different    
+    if len(common_set)<len(fea_check.keys())*(1-diff_th_error):
+            sys.stderr.write('ERROR: The given labels differ too much. Please, take a look into the provided labels and make sure they have the same sentence_ids. See the file %s\n' %(output_folder+'/log.log')) 
+            sys.exit(0) 
+            
+    return common_set
+      
+def check_labels(lab_data_dict,output_folder):
+    
+    # This function does some checks on the labels. 
+    # A warning is raised in the log file if some labels are missing. 
+    # If too many labels are missing (e.g., 5%) an error is raised.
+    # Only the common set of labels is selected. 
+    # The function also check if all the labels have the same length.
+        
+    diff_th_error=0.05 
+    lab_data_dict_sel={}
+    
+    for dataset in lab_data_dict.keys():
+        lab_keys=list(lab_data_dict[dataset].keys())
+        
+        current_set_len_sum=0
+        for i in range(len(lab_keys)):
+            lab_key=lab_keys[i]
+            current_set=set(lab_data_dict[dataset][lab_key])
+            current_set_len_sum=current_set_len_sum=current_set_len_sum+len(current_set)
+            
+            if i==0:
+                global_set=current_set
+                diff_set=set(global_set-current_set)
+            else:
+                diff_set=set(global_set-current_set)
+                global_set=global_set.intersection(current_set)
+              
+            
+            if len(diff_set)>0:
+                with open(output_folder+'/log.log', 'a+') as logfile:
+                    for line in diff_set:
+                        logfile.write('WARNING: No labels for '+ line+'\n')
+            
+
+        mean_set_len=int(current_set_len_sum/len(lab_keys))
+
+        # Rise an error if the labels set are too different    
+        if len(global_set)< mean_set_len*(1-diff_th_error):
+            sys.stderr.write('ERROR: The given labels differ too much. Please, take a look into the provided labels and make sure they have the same sentence_ids. See the file %s\n' %(output_folder+'/log.log')) 
+            sys.exit(0)
+   
+        
+        # Select the subset of common labels
+        lab_data_dict_sel[dataset]={}
+        for key in lab_data_dict[dataset].keys():
+            lab_data_dict_sel[dataset][key] = { k:v for k, v in  lab_data_dict[dataset][key].items() if k in list(global_set)}
+        
+    
+        # check if all the label types have the same length
+        for snt_id in list(global_set):
+            lab_type_key=list(lab_data_dict_sel[dataset].keys())
+            for i in range(len(lab_type_key)):
+                if i==0:
+                    ref= lab_data_dict_sel[dataset][lab_type_key[i]][snt_id].shape[0]
+                else:
+                    val= lab_data_dict_sel[dataset][lab_type_key[i]][snt_id].shape[0]
+                    if val!=ref:
+                       sys.stderr.write('ERROR: the sentence %s has different label lengths between %s and %s. All the labels must have the same length.\n' %(snt_id,lab_type_key[i],lab_type_key[0])) 
+                       sys.exit(0)
+                   
+    return lab_data_dict_sel
+
+def select_fea(fea_data_dict,common_set):  
+    # This function selects only the subset of features that have the corresponding label
+    
+    for fea_key in fea_data_dict.keys():
+        snt_lst=list(fea_data_dict[fea_key].keys())
+        for snt_id in snt_lst.copy():
+            if snt_id not in common_set:
+                print(snt_id)
+                del(fea_data_dict[fea_key][snt_id ])   
+    return fea_data_dict
+
+def select_lab(lab_all,dataset,common_set): 
+    # This function selects only the subset of labels that are actually used in this chunk 
+    
+    lab_chunk={}            
+    for lab_key in lab_all[dataset].keys():
+        lab_chunk[lab_key]={}
+        for snt_id in lab_all[dataset][lab_key].keys():
+            if snt_id in common_set:
+                lab_chunk[lab_key][snt_id]=lab_all[dataset][lab_key][snt_id] 
+    return lab_chunk
+
+def split_fea(fea_data_dict,max_seq_length):
+    
+    # Split the features that are longer than Max_length 
+    for fea in fea_data_dict.keys():   
+    
+      snt_ids=list(fea_data_dict[fea].keys())
+      
+      for k in snt_ids.copy():
+          if fea_data_dict[fea][k].shape[0]> max_seq_length:
+              N_split=math.ceil(fea_data_dict[fea][k].shape[0]/max_seq_length)
+              data_split=np.array_split(fea_data_dict[fea][k],N_split)
+              data_split_name=[k+'_split'+str(i) for i in range(N_split)]
+              del fea_data_dict[fea][k]
+              fea_data_dict[fea].update(zip(data_split_name,data_split))
+              
+    return fea_data_dict
+
+def split_lab(lab_chunk,max_seq_length):
+    
+    # Split the labels that are longer than Max_length 
+    for lab_type in lab_chunk.keys():
+        snt_ids=list(lab_chunk[lab_type].keys())
+        for k in snt_ids.copy():
+            if lab_chunk[lab_type][k].shape[0]> max_seq_length:
+                N_split=math.ceil(lab_chunk[lab_type][k].shape[0]/max_seq_length)
+                lab_split=np.array_split(lab_chunk[lab_type][k],N_split)
+                lab_split_name=[k+'_split'+str(i) for i in range(N_split)]
+                del lab_chunk[lab_type][k]
+                lab_chunk[lab_type].update(zip(lab_split_name,lab_split))
+                
+    return lab_chunk
+
+def split_list(l,n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+        
+def compute_dim(data_dict):
+    dim_dict={}
+    for key in data_dict.keys():
+        snt_id=list(data_dict[key].keys())
+        shape_dim=data_dict[key][snt_id[0]].shape
+        if len(shape_dim) > 1:
+            dim=shape_dim[-1]
+        else:
+            dim=1
+        
+        dim_dict[key]=dim
+    return dim_dict
+            
+            
+def create_all_fea_lst(fea_data_dict,snt_lst):
+    
+    # This function creates a list containing all the features in the chuck. 
+    # The output is a list containing elements formatted in the following way: “fea_id_time_step_id”. 
+    # We can shuffle the dataset by simply shuffling this list.
+    
+    list_all_fea=[]
+    fea_id=list(fea_data_dict.keys())[0]
+
+    for snt_id in snt_lst:
+        N_time_steps=fea_data_dict[fea_id][snt_id].shape[0]
+        for time_step in range(N_time_steps):
+            list_all_fea.append(snt_id+':Frame_'+str(time_step))  
+    return list_all_fea
+
+def compute_mean_std(fea_data_dict):
+    #This function computes for each sentence the mean and the standard deviation. 
+    #The global mean and standard deviations are stored in the key “global”.
+    
+    mean_dict={}
+    std_dict={}
+    
+    for fea_id in fea_data_dict.keys():
+        mean_dict[fea_id]={}
+        std_dict[fea_id]={}
+        count=0
+        for snt_id in fea_data_dict[fea_id].keys():
+            mean_dict[fea_id][snt_id]=np.mean(fea_data_dict[fea_id][snt_id],axis=0)
+            std_dict[fea_id][snt_id]=np.std(fea_data_dict[fea_id][snt_id],axis=0)
+            if count==0:
+                std_dict[fea_id]['global']=std_dict[fea_id][snt_id]
+                mean_dict[fea_id]['global']=mean_dict[fea_id][snt_id]
+            else:
+                std_dict[fea_id]['global']=std_dict[fea_id]['global']+std_dict[fea_id][snt_id]
+                mean_dict[fea_id]['global']=mean_dict[fea_id]['global']+mean_dict[fea_id][snt_id]
+                
+            count=count+1
+        std_dict[fea_id]['global']=std_dict[fea_id]['global']/len(list(fea_data_dict[fea_id].keys()))
+        mean_dict[fea_id]['global']=mean_dict[fea_id]['global']/len(list(fea_data_dict[fea_id].keys()))
+        
+    return [mean_dict,std_dict]
+
+
+
+def apply_cmnv(fea_data_dict,mean_dict,std_dict):
+    
+    #This function performs mean and variance normalization using the statistics previously computed.   
+    for fea_id in fea_data_dict.keys():
+        for snt_id in fea_data_dict[fea_id].keys():
+            fea_data_dict[fea_id][snt_id]=(fea_data_dict[fea_id][snt_id]-mean_dict[fea_id]['global'])/std_dict[fea_id]['global']                  
+    
+    return fea_data_dict
+
+
+def double_check_fea_lab(fea_data_dict,lab_chunk):
+                         
+    # This function double checks that all the features have the same number of frames.
+    
+    fea_ids=list(fea_data_dict.keys())
+    lab_ids=list(lab_chunk.keys())
+    
+    for snt_id in fea_data_dict[fea_ids[0]].keys():
+        count=0
+
+        for fea_id in fea_ids:
+             len_snt=fea_data_dict[fea_id][snt_id].shape[0]
+             if count==0:
+                 len_snt_prev=len_snt
+                 count=1
+             else:
+                 if len_snt_prev!=len_snt:
+                      sys.stderr.write('ERROR the sentence %s has different length between %s and %s\n' %(snt_id,fea_ids[0],fea_id)) 
+                      sys.exit(0)                         
+             
+        for lab_id in lab_ids:
+            len_snt=lab_chunk[lab_id][snt_id].shape[0]
+            if len_snt_prev!=len_snt:
+                      sys.stderr.write('ERROR the sentence %s has different length between %s and %s\n' %(snt_id,fea_ids[0],lab_id)) 
+                      sys.exit(0)  
+                      
+                      
+def detect_lab_type(lab_folder):
+      
+      lab_type='not_founded'
+      
+      if len(lab_folder.split('.'))==2:
+          
+          if (lab_folder.split('.')[1])=='npy':
+              # check if the file exsits:
+              if os.path.isfile(lab_folder):
+                  lab_type='dict'
+              else:
+                 sys.stderr.write('ERROR: The file %s does not exists.\n'%(lab_folder))
+                 sys.exit(0)   
+          
+          if (lab_folder.split('.')[1])=='lst':
+              # check if the file exsits:
+              if not(os.path.isfile(lab_folder)):
+                 sys.stderr.write('ERROR: The file %s does not exists.\n'%(lab_folder))
+                 sys.exit(0)   
+             
+              else: 
+                with open(lab_folder) as f:
+                    content = f.readlines()
+                if len(content)==sum(1 for i in content if (len(i.split(' '))==2 and i.strip().split(' ')[1].isdigit())):
+                  lab_type='lab_lst'
+                else:
+                    sys.stderr.write('ERROR: The file %s must only contains lines formatted in the following way “sentence_id label”. The label must be an integer number. Please make sure you only have integer numbers in the file. Make also sure no additional spaces are placed after the label or between the sentence-id and the label. Moreover, delete any empty line in the file  if present (including the last one).\n'%(lab_folder))
+                    sys.exit(0)
+                    
+      else:
+          
+          if lab_folder!='none':
+              if not(os.path.isdir(lab_folder)):
+                sys.stderr.write('ERROR: the Kaldi label folder %s does not exist! \n'%(lab_folder))
+                sys.exit(0)
+              else:
+                  # check if model final.mld is present
+                  if not(os.path.isfile(lab_folder+'/final.mdl')):
+                      sys.stderr.write('ERROR: the file final.mdl is not present in %s \n'%(lab_folder))
+                      sys.exit(0)  
+                      
+                  if not(os.path.isfile(lab_folder+'/ali.1.gz')):
+                      sys.stderr.write('ERROR: alignments are not present in %s. You should have ali.*.gz files \n'%(lab_folder))
+                      sys.exit(0) 
+                      
+                  lab_type='kaldi'
+          else:
+               lab_type='none' 
+    
+    
+              
+      if lab_type=='not_founded':
+           sys.stderr.write('ERROR: Not able to detect the right type of labels. Possibilities are “kaldi”, “lab_lst”, and “dict”, and "none". If you would like to use lab_lst the file must have ".lst" extension and must contain "sentence_id label" entries. The dict, instead, should have a npy extension. Use none is you do not have the labels (e.g, for production/testing purposes). Please check %s\n'%(lab_folder))
+           sys.exit(0)
+           
+      return lab_type          
+    
+
+def detect_fea_type(fea_scp):
+    return 'kaldi'
+
+def create_data_dict(config):
+    #This function summarizes the features and labels of each used dataset into a dictionary.
+    
+    data_dict={}
+    for sec in  config.sections():
+        if "dataset" in sec:
+            data_name=config[sec]['data_name']
+            data_dict[data_name]={}
+            data_dict[data_name]['fea']={}
+            data_dict[data_name]['lab']={}
+            
+    
+            fea_lst=list(filter(None, config[sec]['fea'].split('fea_name=')))
+            
+            for fea in fea_lst:
+                list_fea=list(filter(None,fea.split('\n')))
+                fea_name=list_fea[0]
+                if fea_name  in config['model']['model']: # Select only features actually used in [Model]
+                    data_dict[data_name]['fea'][fea_name]=list_fea[1:]
+             
+            if data_name in config['data_use']['train_with'] or data_name in config['data_use']['valid_with']:
+                
+                lab_lst=list(filter(None, config[sec]['lab'].split('lab_name=')))
+                
+                for lab in lab_lst:
+                    list_lab=list(filter(None,lab.split('\n')))
+                    lab_name=list_lab[0]
+                    if lab_name  in config['model']['model']: # Select only labels actually used in [Model]
+                        data_dict[data_name]['lab'][lab_name]=list_lab[1:]
+                    
+    return data_dict
+
+def check_if_fea_exist(config):
+    
+    #This function checks if all the specified features exist. 
+    #It raises an error if at least one feature is not found.
+
+    data_dict=create_data_dict(config)
+    for dataset in data_dict.keys():
+        for fea_name in data_dict[dataset]['fea'].keys():
+            fea_scp=data_dict[dataset]['fea'][fea_name][0].split('=')[1]
+            fea_paths=[]
+            for fea_line in open(fea_scp):
+                fea_paths.append(fea_line.split(' ')[1].split(':')[0])
+
+            for fea_path in set(fea_paths):
+                if not(os.path.isfile(fea_path)):
+                    sys.stderr.write('ERROR file %s in %s does not exist\n' %(fea_path,fea_scp)) 
+                    sys.exit(0)
+                     
+                    
+                
 def load_counts(class_counts_file):
     with open(class_counts_file) as f:
         row = next(f).strip().strip('[]').strip()
         counts = np.array([ np.float32(v) for v in row.split() ])
     return counts 
 
-def read_lab_fea(cfg_file,fea_only,shared_list,output_folder):
-    
-    # Reading chunk-specific cfg file (first argument-mandatory file) 
-    if not(os.path.exists(cfg_file)):
-         sys.stderr.write('ERROR: The config file %s does not exist!\n'%(cfg_file))
-         sys.exit(0)
-    else:
-        config = configparser.ConfigParser()
-        config.read(cfg_file)
+
+def lab_to_pytorch(lab_all):
+    # This function converts all the entries of the label dictionary from numpy to pytorch tensors.
+    for data_id in lab_all.keys():
+        for lab_id in lab_all[data_id].keys():
+            for snt_id in lab_all[data_id][lab_id].keys():
+                lab_all[data_id][lab_id][snt_id]=torch.from_numpy(lab_all[data_id][lab_id][snt_id].copy())
+    return lab_all
+
+def fea_to_pytorch(fea_data_dict):
+    # This function converts all features from numpy to pytorch tensors.
+    for fea_id in fea_data_dict.keys():
+        for snt_id in fea_data_dict[fea_id].keys():
+            fea_data_dict[fea_id][snt_id]=torch.from_numpy(fea_data_dict[fea_id][snt_id])
+    return fea_data_dict 
         
-    
-    # Reading some cfg parameters
-    to_do=config['exp']['to_do']
-    
-    if to_do=='train':
-        max_seq_length=int(config['batches']['max_seq_length_train']) #*(int(info_file[-13:-10])+1) # increasing over the epochs
 
-    if to_do=='valid':
-        max_seq_length=int(config['batches']['max_seq_length_valid'])
-
-    if to_do=='forward':
-        max_seq_length=-1 # do to break forward sentences
-    
-    
-    [fea_dict,lab_dict,arch_dict]=dict_fea_lab_arch(config)
-    
-    [cw_left_max,cw_right_max]=compute_cw_max(fea_dict)
-    
-    fea_index=0
-    cnt_fea=0
-
-    for fea in fea_dict.keys():
+def fea_to_cuda(features):
+    # This function converts all features to cuda
+    for fea_id in features.keys():
+        features[fea_id]=features[fea_id].cuda()
         
-        # reading the features
-        fea_scp=fea_dict[fea][1]
-        fea_opts=fea_dict[fea][2]
-        cw_left=int(fea_dict[fea][3])
-        cw_right=int(fea_dict[fea][4])
-        
-        cnt_lab=0
-
-        # Production case, we don't have labels (lab_name = none)
-        if fea_only:
-          lab_dict.update({'lab_name':'none'})
-
-        for lab in lab_dict.keys():
-            
-            # Production case, we don't have labels (lab_name = none)
-            if fea_only:
-              lab_folder=None 
-              lab_opts=None
-            else:
-              lab_folder=lab_dict[lab][1]
-              lab_opts=lab_dict[lab][2]
-    
-            [data_name_fea,data_set_fea,data_end_index_fea]=load_chunk(fea_scp,fea_opts,lab_folder,lab_opts,cw_left,cw_right,max_seq_length, output_folder, fea_only)
-    
-            
-            # making the same dimenion for all the features (compensating for different context windows)
-            labs_fea=data_set_fea[cw_left_max-cw_left:data_set_fea.shape[0]-(cw_right_max-cw_right),-1]
-            data_set_fea=data_set_fea[cw_left_max-cw_left:data_set_fea.shape[0]-(cw_right_max-cw_right),0:-1]
-            data_end_index_fea=data_end_index_fea-(cw_left_max-cw_left)
-            data_end_index_fea[-1]=data_end_index_fea[-1]-(cw_right_max-cw_right)
-    
-            
-            
-            if cnt_fea==0 and cnt_lab==0:
-                data_set=data_set_fea
-                labs=labs_fea
-                data_end_index=data_end_index_fea
-                data_end_index=data_end_index_fea
-                data_name=data_name_fea
-                
-                fea_dict[fea].append(fea_index)
-                fea_index=fea_index+data_set_fea.shape[1]
-                fea_dict[fea].append(fea_index)
-                fea_dict[fea].append(fea_dict[fea][6]-fea_dict[fea][5])
-                
-                
-            else:
-                if cnt_fea==0:
-                    labs=np.column_stack((labs,labs_fea))
-                
-                if cnt_lab==0:
-                    data_set=np.column_stack((data_set,data_set_fea))
-                    fea_dict[fea].append(fea_index)
-                    fea_index=fea_index+data_set_fea.shape[1]
-                    fea_dict[fea].append(fea_index)
-                    fea_dict[fea].append(fea_dict[fea][6]-fea_dict[fea][5])
-                
-                
-                # Checks if lab_names are the same for all the features
-                if not(data_name==data_name_fea):
-                    sys.stderr.write('ERROR: different sentence ids are detected for the different features. Plase check again input feature lists"\n')
-                    sys.exit(0)
-                
-                # Checks if end indexes are the same for all the features
-                if not(data_end_index==data_end_index_fea).all():
-                    sys.stderr.write('ERROR end_index must be the same for all the sentences"\n')
-                    sys.exit(0)
-                    
-            cnt_lab=cnt_lab+1
-    
-    
-        cnt_fea=cnt_fea+1
-        
-    cnt_lab=0
-    if not fea_only:   
-      for lab in lab_dict.keys():
-          lab_dict[lab].append(data_set.shape[1]+cnt_lab)
-          cnt_lab=cnt_lab+1
-           
-    data_set=np.column_stack((data_set,labs))
-    
-    # check automatically if the model is sequential
-    seq_model=is_sequential_dict(config,arch_dict)
-    
-    # Randomize if the model is not sequential
-    if not(seq_model) and to_do!='forward':
-        np.random.shuffle(data_set)
-     
-    # Split dataset in many part. If the dataset is too big, we can have issues to copy it into the shared memory (due to pickle limits)
-    #N_split=10
-    #data_set=np.array_split(data_set, N_split)
-    
-    # Adding all the elements in the shared list    
-    shared_list.append(data_name)
-    shared_list.append(data_end_index)
-    shared_list.append(fea_dict)
-    shared_list.append(lab_dict)
-    shared_list.append(arch_dict)
-    shared_list.append(data_set)
-    
-
-
+    return features
 
 # The following libraries are copied from kaldi-io-for-python project (https://github.com/vesis84/kaldi-io-for-python)
     
