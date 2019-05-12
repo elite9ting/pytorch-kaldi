@@ -23,6 +23,9 @@ To improve transparency and replicability of speech recognition results, we give
 
 [See a short introductory video on the PyTorch-Kaldi Toolkit](https://www.youtube.com/watch?v=VDQaf0SS4K0&t=2s)
 
+## Next Version
+We are actively working on the next version of PyTorch-Kaldi (v0.3). The architecture of the toolkit will be more modular and flexible. Beyond speech recognition, the new toolkit will be suitable for other applications such as speaker recognition, speech enhancement, speech separation, etc.
+The toolkit will support labels and features in many different formats (not just the current kaldi one) and will be much easier feeding the system with the raw samples directly. The toolkit will support a number of data processing functions, including data augmentation and contamination. We are also working to support self-supervised training.  
 
 ## Table of Contents
 * [Introduction](#introduction)
@@ -230,6 +233,7 @@ There are some examples with recurrent (TIMIT_RNN*,TIMIT_LSTM*,TIMIT_GRU*,TIMIT_
 |  Kaldi DNN Baseline | -----| ------| 18.5 |
 |  MLP  | 18.2 | 18.7 | 16.7 | 
 |  RNN  | 17.7 | 17.2 | 15.9 | 
+|  SRU  | -----| 16.6 | -----|
 |LSTM| 15.1  | 14.3  |14.5  | 
 |GRU| 16.0 | 15.2|  14.9 | 
 |li-GRU| **15.5**  | **14.9**|  **14.2** | 
@@ -237,6 +241,13 @@ There are some examples with recurrent (TIMIT_RNN*,TIMIT_LSTM*,TIMIT_GRU*,TIMIT_
 Results show that, as expected, fMLLR features outperform MFCCs and FBANKs coefficients, thanks to the speaker adaptation process. Recurrent models significantly outperform the standard MLP one, especially when using LSTM, GRU, and Li-GRU architecture, that effectively address gradient vanishing through multiplicative gates. The best result *PER=$14.2$\%* is obtained with the [Li-GRU model](https://arxiv.org/pdf/1803.10225.pdf) [2,3], that is based on a single gate and thus saves 33% of the computations over a standard GRU. 
 
 The best results are actually obtained with a more complex architecture that combines MFCC, FBANK, and fMLLR features (see *cfg/TIMI_baselines/TIMIT_mfcc_fbank_fmllr_liGRU_best.cfg*). To the best of our knowledge, the **PER=13.8\%** achieved by the latter system yields the best-published performance on the TIMIT test-set. 
+
+The Simple Recurrent Units (SRU) is an efficient and highly parallelizable recurrent model. Its performance on ASR is worse than standard LSTM, GRU, and Li-GRU models, but it is significantly faster. SRU is implemented [here](https://github.com/taolei87/sru) and described in the following paper:
+
+T. Lei, Y. Zhang, S. I. Wang, H. Dai, Y. Artzi, "Simple Recurrent Units for Highly Parallelizable Recurrence, Proc. of EMNLP 2018. [arXiv](https://arxiv.org/pdf/1709.02755.pdf)
+
+To do experiments with this model, use the config file *cfg/TIMIT_baselines/TIMIT_SRU_fbank.cfg*. Before you should install the model using ```pip install sru``` and you should uncomment "import sru" in *neural_networks.py*.
+
 
 You can directly compare your results with ours by going [here](https://bitbucket.org/mravanelli/pytorch-kaldi-exp-timit/src/master/). In this external repository, you can find all the folders containing the generated files.
 
